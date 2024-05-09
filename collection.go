@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"slices"
+	"golang.org/x/exp/slices"
 	"sync"
 )
 
@@ -156,8 +156,8 @@ func (c *Collection) AddDocuments(ctx context.Context, documents []Document, con
 
 	var sharedErr error
 	sharedErrLock := sync.Mutex{}
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	setSharedErr := func(err error) {
 		sharedErrLock.Lock()
 		defer sharedErrLock.Unlock()
@@ -165,7 +165,7 @@ func (c *Collection) AddDocuments(ctx context.Context, documents []Document, con
 		if sharedErr == nil {
 			sharedErr = err
 			// Cancel the operation for all other goroutines.
-			cancel(sharedErr)
+			cancel()
 		}
 	}
 
@@ -362,7 +362,8 @@ func (c *Collection) QueryEmbedding(ctx context.Context, queryEmbedding []float3
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 	if nResults > len(c.documents) {
-		return nil, errors.New("nResults must be <= the number of documents in the collection")
+        nResults = len(c.documents)
+		//return nil, errors.New("nResults must be <= the number of documents in the collection")
 	}
 
 	if len(c.documents) == 0 {
@@ -414,4 +415,76 @@ func (c *Collection) getDocPath(docID string) string {
 		docPath += ".gz"
 	}
 	return docPath
+}
+
+func (c *Collection) FilterDocs(ctx context.Context, nResults int, where, whereDocument map[string]string) ([]*Document, error) {
+	if len(where) <= 0 || len(whereDocument) <= 0 {
+		return nil, errors.New("filter condition is empty")
+	}
+    if nResults <= 0 {
+		return nil, errors.New("nResults must be > 0")
+	}
+	c.documentsLock.RLock()
+    defer c.documentsLock.RUnlock()
+
+    if len(c.documents) == 0 {
+        return nil, nil
+    }
+
+    // Validate whereDocument operators
+    for k := range whereDocument {
+        if !slices.Contains(supportedFilters, k) {
+            return nil, errors.New("unsupported operator")
+        }
+    }
+
+    // Filter docs by metadata and content
+    filteredDocs := filterDocs(c.documents, where, whereDocument)
+
+    // No need to continue if the filters got rid of all documents
+    if len(filteredDocs) == 0 {
+        return nil, nil
+    }
+    if nResults > 0 && len(filteredDocs) > nResults  {
+        return filteredDocs[:nResults], nil
+    }
+
+	return filteredDocs, nil
+}
+
+func (c *Collection) RetrieveDocsWithIds(ctx context.Context, ids []string, where, whereDocument map[string]string) ([]*Document, error) {
+	if len(ids) < 0 {
+        return nil, errors.New("params ids is empty")
+	}
+
+	c.documentsLock.RLock()
+    defer c.documentsLock.RUnlock()
+
+    if len(c.documents) == 0 {
+        return nil, nil
+    }
+
+    // Validate whereDocument operators
+    for k := range whereDocument {
+        if !slices.Contains(supportedFilters, k) {
+            return nil, errors.New("unsupported operator")
+        }
+    }
+
+    // Filter docs by metadata and content
+    filteredDocs := filterDocs(c.documents, where, whereDocument)
+
+    // No need to continue if the filters got rid of all documents
+    if len(filteredDocs) == 0 {
+        return nil, nil
+    }
+
+    var matchedDocs = make([]*Document, 0)
+    for _, doc := range filteredDocs{
+        if slices.Contains(ids, doc.ID) {
+            matchedDocs = append(matchedDocs, doc)
+        }
+    }
+
+	return matchedDocs, nil
 }

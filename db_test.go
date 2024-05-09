@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
+	"golang.org/x/exp/slices"
 	"testing"
 )
 

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"math/rand"
 	"os"
-	"slices"
+	"golang.org/x/exp/slices"
 	"strconv"
 	"testing"
 )
