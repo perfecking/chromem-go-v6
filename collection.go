@@ -43,6 +43,14 @@ func (c *Collection) RegisterLruCleanupTicker(docLimit int, duration time.Durati
     }
     c.docLimit = docLimit
     c.lRUCache = NewLRUCache(docLimit)
+    //刷新集合docs的lru cache
+    if c.documents != nil {
+        c.documentsLock.Lock()
+        for _, doc := range c.documents {
+            c.lRUCache.Put(doc.ID, CacheExistValue)
+        }
+        c.documentsLock.Unlock()
+    }
 
 	// 创建一个周期性定时器
 	c.cleanupTicker = time.NewTicker(duration)
@@ -288,7 +296,7 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 
     //缓存
     if c.lRUCache != nil {
-        c.lRUCache.Put(doc.ID, "exist")
+        c.lRUCache.Put(doc.ID, CacheExistValue)
     }
 
 	c.documentsLock.Unlock()

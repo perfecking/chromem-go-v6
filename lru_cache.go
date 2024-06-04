@@ -4,6 +4,11 @@ import (
 	"container/list"
 )
 
+const (
+    CacheExistValue = "exist"
+)
+
+
 // LRUCache 结构体定义
 type LRUCache struct {
 	capacity int
