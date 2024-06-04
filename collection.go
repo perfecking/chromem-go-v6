@@ -36,7 +36,7 @@ type Collection struct {
 	// versions in [DB.Export] and [DB.Import] as well!
 }
 
-func (c *Collection) RegisterLruCleanupTicker(docLimit int, duration time.Duration) {
+func (c *Collection) RegisterLruCleanupTicker(docLimit int, duration time.Duration, callback func(evictKeys []string)) {
     if c.cleanupTicker != nil {
         //停用旧cleanupFunc
         c.cleanupTicker.Stop()
@@ -47,20 +47,23 @@ func (c *Collection) RegisterLruCleanupTicker(docLimit int, duration time.Durati
 	// 创建一个周期性定时器
 	c.cleanupTicker = time.NewTicker(duration)
 
-	go func() {
+	go func(f func(evictKeys []string)) {
         time.Sleep(10 * time.Second) // 等待一段时间后重新启动
 
 		for {
 			select {
 			case <-c.cleanupTicker.C:
-				c.evictKeys()
+				keys := c.evictKeys()
+                if len(keys) > 0 {
+                    f(keys)
+                }
 			}
 		}
-	}()
+	}(callback)
 }
 
 //执行lru策略淘汰文档
-func (c *Collection) evictKeys() {
+func (c *Collection) evictKeys() []string {
     if c.lRUCache != nil && c.Count() > c.docLimit {
         //实现lru策略，删除
         //doc ids
@@ -72,7 +75,9 @@ func (c *Collection) evictKeys() {
             }
             fmt.Printf("Removed %d documents from LRU cache. keys: %s\n", len(keys), strings.Join(keys, ", "))
         }
+        return keys
     }
+    return nil
 }
 
 // We don't export this yet to keep the API surface to the bare minimum.
