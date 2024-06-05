@@ -3,11 +3,13 @@ package chromem
 import (
 	"context"
 	"errors"
+	"fmt"
+	"golang.org/x/exp/slices"
 	"math/rand"
 	"os"
-	"golang.org/x/exp/slices"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestCollection_Add(t *testing.T) {
@@ -630,4 +632,67 @@ func randomString(r *rand.Rand, n int) string {
 		b[i] = characters[r.Intn(len(characters))]
 	}
 	return string(b)
+}
+
+func TestCollection_LruCapacity(t *testing.T) {
+	ctx := context.Background()
+	name := "test"
+	metadata := map[string]string{"foo": "bar"}
+	vectors := []float32{-0.40824828, 0.40824828, 0.81649655} // normalized version of `{-0.1, 0.1, 0.2}`
+	embeddingFunc := func(_ context.Context, _ string) ([]float32, error) {
+		return vectors, nil
+	}
+
+	// Create collection
+	db := NewDB()
+	c, err := db.CreateCollection(name, metadata, embeddingFunc)
+	if err != nil {
+		t.Fatal("expected no error, got", err)
+	}
+	if c == nil {
+		t.Fatal("expected collection, got nil")
+	}
+    c.RegisterLruCleanupTicker(3, 10 * time.Second)
+
+	c.AddDocument(ctx, Document{
+		ID:        "1",
+		Metadata:  map[string]string{"foo": "bar"},
+		Embedding: vectors,
+		Content:   "1",
+	})
+	c.AddDocument(ctx, Document{
+		ID:        "2",
+		Metadata:  map[string]string{"foo": "bar"},
+		Embedding: vectors,
+		Content:   "2",
+	})
+	c.AddDocument(ctx, Document{
+		ID:        "3",
+		Metadata:  map[string]string{"foo": "bar"},
+		Embedding: vectors,
+		Content:   "3",
+	})
+	c.AddDocument(ctx, Document{
+		ID:        "4",
+		Metadata:  map[string]string{"foo": "bar"},
+		Embedding: vectors,
+		Content:   "4",
+	})
+    c.AddDocument(ctx, Document{
+        ID:        "5",
+        Metadata:  map[string]string{"foo": "bar"},
+        Embedding: vectors,
+        Content:   "5",
+    })
+
+    //提升优先级
+	c.RetrieveDocsWithIds(ctx, []string{"2"}, nil, nil)
+
+	time.Sleep(15 * time.Second)
+
+	docs, err := c.RetrieveDocsWithIds(ctx, []string{"1", "2", "3", "4", "5"}, nil, nil)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("docs: %+v\n", docs)
 }

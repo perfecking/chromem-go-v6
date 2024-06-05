@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"golang.org/x/exp/slices"
-	"sync"
+	"path/filepath"
+	"strings"
+"sync"
+	"time"
 )
 
 // Collection represents a collection of documents.
@@ -23,8 +25,67 @@ type Collection struct {
 	persistDirectory string
 	compress         bool
 
+    lRUCache *LRUCache
+
+    //文档限制
+    docLimit int
+
+    cleanupTicker *time.Ticker
+
 	// ⚠️ When adding fields here, consider adding them to the persistence struct
 	// versions in [DB.Export] and [DB.Import] as well!
+}
+
+func (c *Collection) RegisterLruCleanupTicker(docLimit int, duration time.Duration, callback func(evictKeys []string)) {
+    if c.cleanupTicker != nil {
+        //停用旧cleanupFunc
+        c.cleanupTicker.Stop()
+    }
+    c.docLimit = docLimit
+    c.lRUCache = NewLRUCache(docLimit)
+    //刷新集合docs的lru cache
+    if c.documents != nil {
+        c.documentsLock.Lock()
+        for _, doc := range c.documents {
+            c.lRUCache.Put(doc.ID, CacheExistValue)
+        }
+        c.documentsLock.Unlock()
+    }
+
+	// 创建一个周期性定时器
+	c.cleanupTicker = time.NewTicker(duration)
+
+	go func(f func(evictKeys []string)) {
+        time.Sleep(10 * time.Second) // 等待一段时间后重新启动
+
+		for {
+			select {
+			case <-c.cleanupTicker.C:
+				keys := c.evictKeys()
+                if len(keys) > 0 {
+                    f(keys)
+                }
+			}
+		}
+	}(callback)
+}
+
+//执行lru策略淘汰文档
+func (c *Collection) evictKeys() []string {
+    if c.lRUCache != nil && c.Count() > c.docLimit {
+        //实现lru策略，删除
+        //doc ids
+        keys := c.lRUCache.Evict()
+        if len(keys) > 0 {
+            err := c.Delete(context.Background(), nil, nil, keys...)
+            if err != nil {
+                fmt.Printf("Error deleting keys: %v\n", err)
+            }
+            fmt.Printf("Removed %d documents from LRU cache. keys: %s\n", len(keys), strings.Join(keys, ", "))
+        }
+        return keys
+    }
+    return nil
 }
 
 // We don't export this yet to keep the API surface to the bare minimum.
@@ -232,6 +293,12 @@ func (c *Collection) AddDocument(ctx context.Context, doc Document) error {
 	c.documentsLock.Lock()
 	// We don't defer the unlock because we want to do it earlier.
 	c.documents[doc.ID] = &doc
+
+    //缓存
+    if c.lRUCache != nil {
+        c.lRUCache.Put(doc.ID, CacheExistValue)
+    }
+
 	c.documentsLock.Unlock()
 
 	// Persist the document
@@ -290,6 +357,11 @@ func (c *Collection) Delete(_ context.Context, where, whereDocument map[string]s
 
 	for _, docID := range docIDs {
 		delete(c.documents, docID)
+
+        //清理缓存
+        if c.lRUCache != nil {
+            c.lRUCache.Delete(docID)
+        }
 
 		// Remove the document from disk
 		if c.persistDirectory != "" {
@@ -362,7 +434,7 @@ func (c *Collection) QueryEmbedding(ctx context.Context, queryEmbedding []float3
 	c.documentsLock.RLock()
 	defer c.documentsLock.RUnlock()
 	if nResults > len(c.documents) {
-        nResults = len(c.documents)
+		nResults = len(c.documents)
 		//return nil, errors.New("nResults must be <= the number of documents in the collection")
 	}
 
@@ -393,13 +465,20 @@ func (c *Collection) QueryEmbedding(ctx context.Context, queryEmbedding []float3
 
 	res := make([]Result, 0, nResults)
 	for i := 0; i < nResults; i++ {
+        docID := nMaxDocs[i].docID
+
 		res = append(res, Result{
-			ID:         nMaxDocs[i].docID,
+			ID:         docID,
 			Metadata:   c.documents[nMaxDocs[i].docID].Metadata,
 			Embedding:  c.documents[nMaxDocs[i].docID].Embedding,
 			Content:    c.documents[nMaxDocs[i].docID].Content,
 			Similarity: nMaxDocs[i].similarity,
 		})
+
+        //更新缓存
+        if c.lRUCache != nil {
+            c.lRUCache.Get(docID)
+        }
 	}
 
 	// Return the top nResults
@@ -421,70 +500,75 @@ func (c *Collection) FilterDocs(ctx context.Context, nResults int, where, whereD
 	if len(where) <= 0 || len(whereDocument) <= 0 {
 		return nil, errors.New("filter condition is empty")
 	}
-    if nResults <= 0 {
+	if nResults <= 0 {
 		return nil, errors.New("nResults must be > 0")
 	}
 	c.documentsLock.RLock()
-    defer c.documentsLock.RUnlock()
+	defer c.documentsLock.RUnlock()
 
-    if len(c.documents) == 0 {
-        return nil, nil
-    }
+	if len(c.documents) == 0 {
+		return nil, nil
+	}
 
-    // Validate whereDocument operators
-    for k := range whereDocument {
-        if !slices.Contains(supportedFilters, k) {
-            return nil, errors.New("unsupported operator")
-        }
-    }
+	// Validate whereDocument operators
+	for k := range whereDocument {
+		if !slices.Contains(supportedFilters, k) {
+			return nil, errors.New("unsupported operator")
+		}
+	}
 
-    // Filter docs by metadata and content
-    filteredDocs := filterDocs(c.documents, where, whereDocument)
+	// Filter docs by metadata and content
+	filteredDocs := filterDocs(c.documents, where, whereDocument)
 
-    // No need to continue if the filters got rid of all documents
-    if len(filteredDocs) == 0 {
-        return nil, nil
-    }
-    if nResults > 0 && len(filteredDocs) > nResults  {
-        return filteredDocs[:nResults], nil
-    }
+	// No need to continue if the filters got rid of all documents
+	if len(filteredDocs) == 0 {
+		return nil, nil
+	}
+	if nResults > 0 && len(filteredDocs) > nResults {
+		return filteredDocs[:nResults], nil
+	}
 
 	return filteredDocs, nil
 }
 
 func (c *Collection) RetrieveDocsWithIds(ctx context.Context, ids []string, where, whereDocument map[string]string) ([]*Document, error) {
 	if len(ids) < 0 {
-        return nil, errors.New("params ids is empty")
+		return nil, errors.New("params ids is empty")
 	}
 
 	c.documentsLock.RLock()
-    defer c.documentsLock.RUnlock()
+	defer c.documentsLock.RUnlock()
 
-    if len(c.documents) == 0 {
-        return nil, nil
-    }
+	if len(c.documents) == 0 {
+		return nil, nil
+	}
 
-    // Validate whereDocument operators
-    for k := range whereDocument {
-        if !slices.Contains(supportedFilters, k) {
-            return nil, errors.New("unsupported operator")
-        }
-    }
+	// Validate whereDocument operators
+	for k := range whereDocument {
+		if !slices.Contains(supportedFilters, k) {
+			return nil, errors.New("unsupported operator")
+		}
+	}
 
-    // Filter docs by metadata and content
-    filteredDocs := filterDocs(c.documents, where, whereDocument)
+	// Filter docs by metadata and content
+	filteredDocs := filterDocs(c.documents, where, whereDocument)
 
-    // No need to continue if the filters got rid of all documents
-    if len(filteredDocs) == 0 {
-        return nil, nil
-    }
+	// No need to continue if the filters got rid of all documents
+	if len(filteredDocs) == 0 {
+		return nil, nil
+	}
 
-    var matchedDocs = make([]*Document, 0)
-    for _, doc := range filteredDocs{
-        if slices.Contains(ids, doc.ID) {
-            matchedDocs = append(matchedDocs, doc)
-        }
-    }
+	var matchedDocs = make([]*Document, 0)
+	for _, doc := range filteredDocs {
+		if slices.Contains(ids, doc.ID) {
+			matchedDocs = append(matchedDocs, doc)
+
+            //更新缓存
+            if c.lRUCache != nil {
+                c.lRUCache.Get(doc.ID)
+            }
+		}
+	}
 
 	return matchedDocs, nil
 }
